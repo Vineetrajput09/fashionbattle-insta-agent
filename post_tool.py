@@ -10,7 +10,8 @@ Sirf 1 secret chahiye (routine ke environment variables mein):
 
 Commands:
   python post_tool.py check          -> token aur API sahi hai ya nahi
-  python post_tool.py next           -> agla product chuno, photos taiyar karo
+  python post_tool.py next           -> agla product chuno, photos download karo
+  python post_tool.py design "Short Title"  -> frame + logo + price badge wali photos banao
   python post_tool.py post caption.txt  -> Instagram par post karo
 """
 
@@ -34,6 +35,7 @@ IG_LOGIN = IG_ACCESS_TOKEN.startswith("IG")
 GRAPH = "https://graph.instagram.com/v21.0" if IG_LOGIN else "https://graph.facebook.com/v21.0"
 ROOT = os.path.dirname(os.path.abspath(__file__))
 IMG_DIR = os.path.join(ROOT, "public_images")
+RAW_DIR = os.path.join(ROOT, "raw_images")
 POSTED_FILE = os.path.join(ROOT, "posted.json")
 NEXT_FILE = os.path.join(ROOT, "next_post.json")
 
@@ -116,16 +118,14 @@ def safe_url(u):
     s = urlsplit(u)
     return urlunsplit((s.scheme, s.netloc, quote(s.path, safe="/%"), s.query, s.fragment))
 
-def prepare_image(url, name):
-    """PNG / lambi photo -> Instagram-ready 1080x1350 JPEG."""
+def download_image(url, name):
+    """Asli product photo download karke raw_images/ mein rakhna (GitHub par nahi jaati)."""
     r = requests.get(safe_url(url), timeout=60)
     r.raise_for_status()
     img = ImageOps.exif_transpose(Image.open(io.BytesIO(r.content))).convert("RGB")
-    img.thumbnail((1080, 1350))
-    canvas = Image.new("RGB", (1080, 1350), "white")
-    canvas.paste(img, ((1080 - img.width) // 2, (1350 - img.height) // 2))
-    canvas.save(os.path.join(IMG_DIR, name), "JPEG", quality=90)
-    return f"public_images/{name}"
+    path = os.path.join(RAW_DIR, name)
+    img.save(path, "JPEG", quality=95)
+    return path
 
 def cleanup_old_images(keep_days=3):
     cutoff = time.time() - keep_days * 86400
@@ -243,21 +243,47 @@ def cmd_next():
         return
     candidates.sort(key=lambda p: p.get("createdAt", ""), reverse=True)   # naye pehle
 
+    os.makedirs(RAW_DIR, exist_ok=True)
     for p in candidates[:3]:
-        images = []
+        raw = []
         for i, u in enumerate((p.get("images") or [p["primary_image"]])[:MAX_PHOTOS]):
             try:
-                images.append(prepare_image(u, f"{p['_id']}_{i}.jpg"))
+                raw.append(download_image(u, f"{p['_id']}_{i}.jpg"))
             except Exception:
                 continue
-        if images:
-            data = {"id": p["_id"], "info": product_info(p), "images": images,
+        if raw:
+            data = {"id": p["_id"], "info": product_info(p), "raw_images": raw, "images": [],
                     "remaining_after_this": len(candidates) - 1}
             with open(NEXT_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=1)
             print(json.dumps(data, ensure_ascii=False, indent=1))
             return
     fail("Pehle 3 products mein se kisi ki photo download nahi hui.")
+
+def cmd_design(title):
+    """Har photo par frame + logo. Pehli photo par price badge bhi."""
+    from design import make_post_image
+    try:
+        with open(NEXT_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        fail("next_post.json nahi mila. Pehle 'python post_tool.py next' chalao.")
+    info = data["info"]
+    title = (title or "").strip()[:40] or None
+    price = f"\u20b9{info['selling_price']:,}" if info.get("selling_price") else None
+    os.makedirs(IMG_DIR, exist_ok=True)
+    images = []
+    for i, raw in enumerate(data["raw_images"]):
+        name = f"{data['id']}_{i}.jpg"
+        if i == 0:
+            make_post_image(raw, os.path.join(IMG_DIR, name), title, price, info.get("discount_percent"))
+        else:
+            make_post_image(raw, os.path.join(IMG_DIR, name))
+        images.append(f"public_images/{name}")
+    data["images"] = images
+    with open(NEXT_FILE, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    print(f"DESIGNED: {len(images)} photos -> " + ", ".join(images))
 
 def cmd_post(caption_file):
     need_token()
@@ -273,6 +299,8 @@ def cmd_post(caption_file):
         fail("Caption khaali ya bahut chhota hai.")
     if data["id"] in load_posted():
         fail("Ye product pehle hi post ho chuka hai.")
+    if not data.get("images"):
+        fail("Photos design nahi hui. Pehle 'python post_tool.py design \"Title\"' chalao.")
 
     ig_id, _ = get_ig_user_id()
     urls = [public_url(p) for p in data["images"]]
@@ -300,12 +328,14 @@ def cmd_post(caption_file):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2 or sys.argv[1] not in ("check", "next", "post"):
+    if len(sys.argv) < 2 or sys.argv[1] not in ("check", "next", "design", "post"):
         print(__doc__)
         sys.exit(1)
     if sys.argv[1] == "check":
         cmd_check()
     elif sys.argv[1] == "next":
         cmd_next()
+    elif sys.argv[1] == "design":
+        cmd_design(" ".join(sys.argv[2:]))
     else:
         cmd_post(sys.argv[2] if len(sys.argv) > 2 else "caption.txt")
