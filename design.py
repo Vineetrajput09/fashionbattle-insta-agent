@@ -1,6 +1,9 @@
 """
-FashionBattle post design: frame + logo (upar baayein) + price badge.
-Colors badalne ho to neeche SETTINGS mein badlo.
+FashionBattle post design
+=========================
+Renders Instagram-ready 1080x1350 images with the brand frame, the logo in the
+top-left corner and, optionally, a price badge. Adjust colors and sizes in the
+SETTINGS section below.
 """
 
 import math, os
@@ -10,15 +13,15 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ASSETS = os.path.join(HERE, "assets")
 
 # ---------------- SETTINGS ----------------
-W, H = 1080, 1350                      # Instagram 4:5
-FRAME_OUTER = (0, 139, 153)            # teal (logo wala)
-FRAME_LINE = (249, 171, 2)             # orange/gold (logo wala)
-BACKGROUND = (245, 236, 226)           # halka beige
-BADGE_COLOR = (107, 30, 120)           # purple badge
+W, H = 1080, 1350                      # Instagram portrait (4:5)
+FRAME_OUTER = (0, 139, 153)            # Teal, matches the logo
+FRAME_LINE = (249, 171, 2)             # Orange/gold, matches the logo
+BACKGROUND = (245, 236, 226)           # Light beige
+BADGE_COLOR = (107, 30, 120)           # Purple price badge
 BADGE_TEXT = (255, 255, 255)
-OUTER = 30                             # teal border ki motai
-LINE_GAP = 22                          # teal ke andar orange line kitni door
-LINE_W = 5                             # orange line ki motai
+OUTER = 30                             # Teal border thickness
+LINE_GAP = 22                          # Gap between the teal border and the inner line
+LINE_W = 5                             # Inner line thickness
 
 
 def font(name, size):
@@ -26,6 +29,7 @@ def font(name, size):
 
 
 def fit_text(draw, text, name, max_w, start, min_size):
+    """Largest font size (from start down to min_size) that fits max_w."""
     size = start
     while size > min_size:
         f = font(name, size)
@@ -36,6 +40,7 @@ def fit_text(draw, text, name, max_w, start, min_size):
 
 
 def wrap_title(draw, title, name, size, max_w, max_lines=2):
+    """Wrap the title to at most max_lines, adding an ellipsis if it is too long."""
     f = font(name, size)
     words, lines, cur = title.split(), [], ""
     for w in words:
@@ -57,7 +62,7 @@ def wrap_title(draw, title, name, size, max_w, max_lines=2):
 
 
 def scallop_badge(size, color):
-    """Phool jaisa (scalloped) badge, smooth kinaron ke liye 4x par banakar chhota kiya."""
+    """Scalloped badge, drawn at 4x and downscaled for smooth edges."""
     s = 4
     big = size * s
     img = Image.new("RGBA", (big, big), (0, 0, 0, 0))
@@ -74,10 +79,11 @@ def scallop_badge(size, color):
 
 
 def draw_badge(canvas, title, price, discount):
+    """Draw the price badge in the bottom-right corner."""
     size = 330
     badge = scallop_badge(size, BADGE_COLOR + (255,))
 
-    # halki parchhai
+    # Soft drop shadow
     shadow = Image.new("RGBA", (size + 40, size + 40), (0, 0, 0, 0))
     shadow.paste((0, 0, 0, 90), (20, 26), badge.split()[3])
     shadow = shadow.filter(ImageFilter.GaussianBlur(10))
@@ -118,7 +124,7 @@ def draw_badge(canvas, title, price, discount):
 
 
 def draw_logo(canvas):
-    """Sirf logo, bina box ke. Halki parchhai taaki kisi bhi photo par dikhe."""
+    """Logo without a background box; a soft shadow keeps it visible on any photo."""
     logo = Image.open(os.path.join(ASSETS, "logo.png")).convert("RGBA")
     logo.thumbnail((120, 120), Image.LANCZOS)
     pad = 20
@@ -131,17 +137,18 @@ def draw_logo(canvas):
 
 
 def make_post_image(photo_path, out_path, title=None, price=None, discount=None):
+    """Create the final post image. The badge is drawn only when a price is given."""
     canvas = Image.new("RGBA", (W, H), FRAME_OUTER + (255,))
     d = ImageDraw.Draw(canvas)
     d.rectangle((OUTER, OUTER, W - OUTER - 1, H - OUTER - 1), fill=BACKGROUND)
     lg = OUTER + LINE_GAP
     d.rectangle((lg, lg, W - lg - 1, H - lg - 1), outline=FRAME_LINE, width=LINE_W)
 
-    # product photo orange line ke andar, bina kaate
+    # Fit the product photo inside the inner line without cropping
     area = lg + LINE_W + 8
     aw, ah = W - 2 * area, H - 2 * area
     photo = Image.open(photo_path).convert("RGB")
-    scale = min(aw / photo.width, ah / photo.height)   # chhoti photo ko bada bhi karo
+    scale = min(aw / photo.width, ah / photo.height)   # Upscale small photos as well
     photo = photo.resize((int(photo.width * scale), int(photo.height * scale)), Image.LANCZOS)
     canvas.paste(photo, (area + (aw - photo.width) // 2, area + (ah - photo.height) // 2))
 
