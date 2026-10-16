@@ -1,18 +1,20 @@
 #!/usr/bin/env python3
 """
-FashionBattle Instagram Publisher
-=================================
-Helper script executed daily by a Claude Code Routine. Claude writes the caption
+FashionBattle Social Publisher (Instagram + Facebook)
+=====================================================
+Helper script executed daily by a Claude Code Routine. Claude writes the captions
 itself, so no Anthropic API key is required.
 
-Required secret (routine environment variable):
-  IG_ACCESS_TOKEN   Meta access token with Instagram publishing permission
+Secrets (routine environment variables):
+  IG_ACCESS_TOKEN         Required. Meta token with Instagram publishing permission
+  FB_PAGE_ACCESS_TOKEN    Optional. Facebook Page token (pages_manage_posts).
+                          When set, every post is also published to the Facebook Page.
 
 Commands:
-  python post_tool.py check                  Verify the token and the product API
+  python post_tool.py check                  Verify the tokens and the product API
   python post_tool.py next                   Select the next product and download its photos
   python post_tool.py design "Short Title"   Render branded photos (frame, logo, price badge)
-  python post_tool.py post caption.txt       Publish the post to Instagram
+  python post_tool.py post caption.txt       Publish to Instagram (and Facebook if configured)
 """
 
 import os, io, re, sys, json, time, subprocess
@@ -28,16 +30,21 @@ MAX_PHOTOS = int(os.environ.get("MAX_PHOTOS", "4"))
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
 IG_ACCESS_TOKEN = os.environ.get("IG_ACCESS_TOKEN", "")
 IG_USER_ID = os.environ.get("IG_USER_ID", "")             # Optional; detected from the token if empty
+FB_PAGE_ACCESS_TOKEN = os.environ.get("FB_PAGE_ACCESS_TOKEN", "")   # Optional; enables Facebook posting
+FB_PAGE_ID = os.environ.get("FB_PAGE_ID", "")             # Optional; detected from the token if empty
+GRAPH_VERSION = os.environ.get("GRAPH_VERSION", "v25.0")
 
 # "IGAA..." tokens use Instagram Login (graph.instagram.com);
 # "EAA..." tokens use Facebook Login (graph.facebook.com).
 IG_LOGIN = IG_ACCESS_TOKEN.startswith("IG")
-GRAPH = "https://graph.instagram.com/v21.0" if IG_LOGIN else "https://graph.facebook.com/v21.0"
+GRAPH = f"https://graph.instagram.com/{GRAPH_VERSION}" if IG_LOGIN else f"https://graph.facebook.com/{GRAPH_VERSION}"
+FB_GRAPH = f"https://graph.facebook.com/{GRAPH_VERSION}"
 
 ROOT = os.path.dirname(os.path.abspath(__file__))
 IMG_DIR = os.path.join(ROOT, "public_images")   # Branded photos, pushed to GitHub
 RAW_DIR = os.path.join(ROOT, "raw_images")      # Original photos, never committed
 POSTED_FILE = os.path.join(ROOT, "posted.json")
+FB_CAPTION_FILE = os.path.join(ROOT, "caption_facebook.txt")   # Optional Facebook-specific caption
 NEXT_FILE = os.path.join(ROOT, "next_post.json")
 
 
@@ -54,9 +61,10 @@ def load_posted():
     except (FileNotFoundError, json.JSONDecodeError):
         return {}
 
-def mark_posted(pid, name):
+def mark_posted(pid, name, **extra):
     posted = load_posted()
     posted[pid] = {"name": name, "posted_at": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())}
+    posted[pid].update(extra)
     with open(POSTED_FILE, "w", encoding="utf-8") as f:
         json.dump(posted, f, ensure_ascii=False, indent=1)
 
@@ -223,6 +231,44 @@ def ig_wait(cid):
     fail("Instagram took too long to process the image.")
 
 
+# ---------------- Facebook Page (Meta Graph API) ----------------
+def fb_enabled():
+    return bool(FB_PAGE_ACCESS_TOKEN)
+
+def fb_get_page():
+    """Return (page_id, page_name, page_token). Accepts a Page token or a User token."""
+    r = requests.get(f"{FB_GRAPH}/me", params={"fields": "id,name,fan_count",
+                     "access_token": FB_PAGE_ACCESS_TOKEN}, timeout=30).json()
+    if "error" not in r:   # fan_count exists only on Pages, so this is a Page token
+        return FB_PAGE_ID or r["id"], r.get("name"), FB_PAGE_ACCESS_TOKEN
+    acc = requests.get(f"{FB_GRAPH}/me/accounts", params={"fields": "id,name,access_token",
+                       "access_token": FB_PAGE_ACCESS_TOKEN}, timeout=30).json()
+    if "error" in acc:
+        raise RuntimeError(f"Facebook token is invalid or expired: {acc['error'].get('message')}")
+    pages = [p for p in acc.get("data", []) if not FB_PAGE_ID or p["id"] == FB_PAGE_ID]
+    if not pages:
+        raise RuntimeError("No Facebook Page found for this token (missing pages_show_list permission?).")
+    return pages[0]["id"], pages[0]["name"], pages[0]["access_token"]
+
+def fb_post(urls, message):
+    """Publish a photo post (single photo or multi-photo) to the Facebook Page."""
+    page_id, name, token = fb_get_page()
+    media = []
+    for u in urls:   # Step 1: upload every photo unpublished
+        r = requests.post(f"{FB_GRAPH}/{page_id}/photos", data={
+            "url": u, "published": "false", "access_token": token}, timeout=120).json()
+        if "id" not in r:
+            raise RuntimeError(f"Facebook photo upload error: {r.get('error', r)}")
+        media.append(r["id"])
+    data = {"message": message, "access_token": token}   # Step 2: one post with all photos attached
+    for i, mid in enumerate(media):
+        data[f"attached_media[{i}]"] = json.dumps({"media_fbid": mid})
+    r = requests.post(f"{FB_GRAPH}/{page_id}/feed", data=data, timeout=120).json()
+    if "id" not in r:
+        raise RuntimeError(f"Facebook publish error: {r.get('error', r)}")
+    return r["id"], name
+
+
 # ---------------- Commands ----------------
 def cmd_check():
     need_token()
@@ -232,6 +278,14 @@ def cmd_check():
     ok = [p for p in products if is_postable(p)]
     left = [p for p in ok if p["_id"] not in load_posted()]
     print(f"OK: Instagram @{username} (id {ig_id})")
+    if fb_enabled():
+        try:
+            _, page_name, _ = fb_get_page()
+            print(f"OK: Facebook Page '{page_name}'")
+        except Exception as e:
+            print(f"WARNING: Facebook is not working: {e}")
+    else:
+        print("INFO: Facebook posting is off (FB_PAGE_ACCESS_TOKEN is not set)")
     print(f"OK: {len(products)} products in API, {len(ok)} postable, {len(left)} remaining")
 
 def cmd_next():
@@ -323,9 +377,22 @@ def cmd_post(caption_file):
     if "id" not in r:
         fail(f"Publish error: {r.get('error', r)}")
 
-    mark_posted(data["id"], data["info"]["name"])
+    # Instagram is live. Now publish the same post to Facebook (a failure here never blocks the record).
+    fb_status, fb_extra = "Facebook: skipped (FB_PAGE_ACCESS_TOKEN is not set)", {}
+    if fb_enabled():
+        fb_caption = caption
+        if os.path.exists(FB_CAPTION_FILE):
+            with open(FB_CAPTION_FILE, encoding="utf-8") as f:
+                fb_caption = f.read().strip() or caption
+        try:
+            fb_id, page_name = fb_post(urls, fb_caption)
+            fb_status, fb_extra = f"Facebook post id {fb_id} (Page: {page_name})", {"facebook_post_id": fb_id}
+        except Exception as e:
+            fb_status, fb_extra = f"Facebook: FAILED ({e})", {"facebook_error": str(e)[:300]}
+
+    mark_posted(data["id"], data["info"]["name"], instagram_media_id=r["id"], **fb_extra)
     os.remove(NEXT_FILE)
-    print(f"POSTED: {data['info']['name']} | {len(urls)} photos | Instagram media id {r['id']}")
+    print(f"POSTED: {data['info']['name']} | {len(urls)} photos | Instagram media id {r['id']} | {fb_status}")
 
 
 if __name__ == "__main__":
