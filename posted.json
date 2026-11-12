@@ -186,5 +186,11 @@
   "posted_at": "2026-11-11 14:46 UTC",
   "instagram_media_id": "18004658700008958",
   "facebook_error": "Facebook token is invalid or expired: Error validating access token: The session is invalid because the user logged out."
+ },
+ "6ade69eb18e2530a92849cc6": {
+  "name": "Minimal Plain Regular Tee (White)",
+  "posted_at": "2026-11-12 14:45 UTC",
+  "instagram_media_id": "18105872462571455",
+  "facebook_error": "Facebook token is invalid or expired: Error validating access token: The session is invalid because the user logged out."
  }
 }
