@@ -12,7 +12,8 @@ Secrets (routine environment variables):
 
 Commands:
   python post_tool.py check                  Verify the tokens and the product API
-  python post_tool.py next                   Select the next product and download its photos
+  python post_tool.py next                   Select the next product (rotating categories day by day)
+                                             and download its photos
   python post_tool.py design "Short Title"   Render branded photos (frame, logo, price badge)
   python post_tool.py post caption.txt       Publish to Instagram (and Facebook if configured)
 """
@@ -97,6 +98,50 @@ def is_postable(p):
     return (p.get("status") == "active" and not p.get("is_deleted")
             and p.get("approval_status") == 1 and (p.get("stock_quantity") or 0) > 0
             and (p.get("images") or p.get("primary_image")))
+
+# ---------------- Category rotation ----------------
+# Every run posts from a different category than the previous days: the category that was
+# posted least recently (or never) goes first, so categories take turns day by day.
+# CATEGORY_LEVEL picks which part of the category breadcrumb counts as "the category":
+#   0 (default) = full breadcrumb, e.g. "Men > Topwear > T-Shirts"
+#   1 = top level only (e.g. "Men"), 2 = first two levels (e.g. "Men > Topwear"), ...
+CATEGORY_LEVEL = int(os.environ.get("CATEGORY_LEVEL", "0"))
+
+def category_key(p):
+    """Stable category name for a product, used to rotate categories day by day."""
+    cat = p.get("category_id")
+    if isinstance(cat, dict):
+        crumb = cat.get("breadcrumb") or cat.get("name") or cat.get("category_name") or cat.get("_id")
+    else:
+        crumb = cat   # Unpopulated category: just an id string
+    crumb = str(crumb or "").strip()
+    if not crumb:
+        return "Uncategorized"
+    parts = [s.strip() for s in re.split(r"\s*(?:>|/|»|›|\|)\s*", crumb) if s.strip()]
+    if CATEGORY_LEVEL > 0 and parts:
+        parts = parts[:CATEGORY_LEVEL]
+    return " > ".join(parts) or "Uncategorized"
+
+def category_order(candidates, all_products, posted):
+    """Return (ordered_categories, groups). Least recently posted category comes first."""
+    cat_of = {p.get("_id"): category_key(p) for p in all_products}
+    history = sorted(posted.items(), key=lambda kv: kv[1].get("posted_at", ""))
+    last_used = {}
+    for i, (pid, entry) in enumerate(history):
+        cat = entry.get("category") or cat_of.get(pid)
+        if cat:
+            last_used[cat] = i
+    groups = {}
+    for p in candidates:
+        groups.setdefault(category_key(p), []).append(p)
+    for items in groups.values():
+        items.sort(key=lambda p: p.get("createdAt", ""), reverse=True)   # Newest first
+    # Never-posted categories first (-1), then the one posted longest ago.
+    # Tie-break: category with the newest product first.
+    cats = sorted(groups, key=lambda c: groups[c][0].get("createdAt", ""), reverse=True)
+    cats.sort(key=lambda c: last_used.get(c, -1))
+    return cats, groups, last_used
+
 
 def product_info(p):
     """Product details for the caption. Seller contact data is deliberately excluded."""
@@ -287,19 +332,30 @@ def cmd_check():
     else:
         print("INFO: Facebook posting is off (FB_PAGE_ACCESS_TOKEN is not set)")
     print(f"OK: {len(products)} products in API, {len(ok)} postable, {len(left)} remaining")
+    if left:
+        cats, groups, _ = category_order(left, products, load_posted())
+        print(f"OK: {len(cats)} categories with products left (next in rotation first):")
+        for c in cats:
+            print(f"   - {c}: {len(groups[c])} left")
 
 def cmd_next():
     os.makedirs(IMG_DIR, exist_ok=True)
     cleanup_old_images()
     posted = load_posted()
-    candidates = [p for p in fetch_products() if is_postable(p) and p["_id"] not in posted]
+    products = fetch_products()
+    candidates = [p for p in products if is_postable(p) and p["_id"] not in posted]
     if not candidates:
         print("NO_PRODUCTS: All products have already been posted.")
         return
-    candidates.sort(key=lambda p: p.get("createdAt", ""), reverse=True)   # Newest first
+
+    # Category rotation: take the newest product of the least recently posted category.
+    # If its photos fail, fall back to the next category (not the same one again).
+    cats, groups, _ = category_order(candidates, products, posted)
+    order = [groups[c][0] for c in cats] + [p for c in cats for p in groups[c][1:]]
+    print(f"INFO: Category order today: {' | '.join(cats[:5])}{' ...' if len(cats) > 5 else ''}")
 
     os.makedirs(RAW_DIR, exist_ok=True)
-    for p in candidates[:3]:
+    for p in order[:3]:
         raw = []
         for i, u in enumerate((p.get("images") or [p["primary_image"]])[:MAX_PHOTOS]):
             try:
@@ -307,8 +363,8 @@ def cmd_next():
             except Exception:
                 continue
         if raw:
-            data = {"id": p["_id"], "info": product_info(p), "raw_images": raw, "images": [],
-                    "remaining_after_this": len(candidates) - 1}
+            data = {"id": p["_id"], "category": category_key(p), "info": product_info(p),
+                    "raw_images": raw, "images": [], "remaining_after_this": len(candidates) - 1}
             with open(NEXT_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=1)
             print(json.dumps(data, ensure_ascii=False, indent=1))
@@ -390,6 +446,8 @@ def cmd_post(caption_file):
         except Exception as e:
             fb_status, fb_extra = f"Facebook: FAILED ({e})", {"facebook_error": str(e)[:300]}
 
+    if data.get("category"):
+        fb_extra["category"] = data["category"]   # Remembered for tomorrow's category rotation
     mark_posted(data["id"], data["info"]["name"], instagram_media_id=r["id"], **fb_extra)
     os.remove(NEXT_FILE)
     print(f"POSTED: {data['info']['name']} | {len(urls)} photos | Instagram media id {r['id']} | {fb_status}")
