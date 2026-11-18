@@ -16,9 +16,12 @@ Use `post_tool.py` and `design.py` from this repository. Do not modify these scr
    ```
    python post_tool.py next
    ```
-   - Products are picked **category-wise**: every day the script chooses a different category
-     (the one posted least recently, or never), so consecutive days do not repeat the same category.
-     The chosen category is in the `category` field of the output. Do not override this choice.
+   - Products are picked **merchant-wise**: every day the script chooses a different merchant
+     (the one posted least recently, or never) and posts one of its products. When every merchant
+     has had a turn, the round repeats with each merchant's next product. Inside a merchant, a
+     product from a category that was not posted recently is preferred.
+     The chosen merchant and category are in the `merchant` and `category` fields of the output.
+     Do not override this choice.
    - If the output contains `NO_PRODUCTS`, do not post anything. Report it and stop.
    - If the output contains `ERROR`, report the error and stop.
 
@@ -83,7 +86,7 @@ Use `post_tool.py` and `design.py` from this repository. Do not modify these scr
    ```
 
 8. **Final report**
-   Summarize the product name, its category, product link, number of photos, the badge title, whether the post went
+   Summarize the product name, its merchant and category, product link, number of photos, the badge title, whether the post went
    live on Instagram and on Facebook (include any Facebook error), and both captions.
 
 ## Rules
