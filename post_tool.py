@@ -12,7 +12,7 @@ Secrets (routine environment variables):
 
 Commands:
   python post_tool.py check                  Verify the tokens and the product API
-  python post_tool.py next                   Select the next product (rotating categories day by day)
+  python post_tool.py next                   Select the next product (one merchant per day, round-robin)
                                              and download its photos
   python post_tool.py design "Short Title"   Render branded photos (frame, logo, price badge)
   python post_tool.py post caption.txt       Publish to Instagram (and Facebook if configured)
@@ -122,25 +122,72 @@ def category_key(p):
         parts = parts[:CATEGORY_LEVEL]
     return " > ".join(parts) or "Uncategorized"
 
-def category_order(candidates, all_products, posted):
-    """Return (ordered_categories, groups). Least recently posted category comes first."""
-    cat_of = {p.get("_id"): category_key(p) for p in all_products}
+# ---------------- Merchant rotation ----------------
+# ROTATE_BY=merchant (default): day 1 merchant A, day 2 merchant B, ... one product each.
+# When every merchant has had a turn, the round starts again with each merchant's next product.
+# Inside a merchant, the product from the least recently posted category is chosen, so the
+# feed also keeps changing category. ROTATE_BY=category switches back to pure category rotation.
+ROTATE_BY = os.environ.get("ROTATE_BY", "merchant").strip().lower()
+# Optional: the exact product field that identifies the merchant (e.g. "seller_id").
+MERCHANT_FIELD = os.environ.get("MERCHANT_FIELD", "").strip()
+MERCHANT_FIELDS = ["seller_id", "seller", "vendor_id", "vendor", "merchant_id", "merchant",
+                   "store_id", "store", "shop_id", "shop", "user_id", "created_by", "added_by"]
+
+def _ident(v):
+    """Turn a populated object or a plain id into a stable string."""
+    if isinstance(v, dict):
+        v = (v.get("store_name") or v.get("shop_name") or v.get("business_name")
+             or v.get("name") or v.get("_id") or v.get("id"))
+    return str(v).strip() if v not in (None, "", [], {}) else ""
+
+def merchant_key(p):
+    """Stable merchant name/id for a product. Falls back to the brand if no seller field exists."""
+    for f in ([MERCHANT_FIELD] if MERCHANT_FIELD else MERCHANT_FIELDS):
+        key = _ident(p.get(f))
+        if key:
+            return key
+    return _ident(p.get("brand")) or "Unknown merchant"
+
+def merchant_field_used(products):
+    """Which field the merchant is read from (shown by the check command)."""
+    for f in ([MERCHANT_FIELD] if MERCHANT_FIELD else MERCHANT_FIELDS):
+        if any(_ident(p.get(f)) for p in products):
+            return f
+    return "brand (no seller field found)"
+
+def _last_used(posted, all_products, key_fn, field):
+    """Position of the most recent post for every key (higher = posted more recently)."""
+    key_of = {p.get("_id"): key_fn(p) for p in all_products}
     history = sorted(posted.items(), key=lambda kv: kv[1].get("posted_at", ""))
-    last_used = {}
+    last = {}
     for i, (pid, entry) in enumerate(history):
-        cat = entry.get("category") or cat_of.get(pid)
-        if cat:
-            last_used[cat] = i
+        k = entry.get(field) or key_of.get(pid)
+        if k:
+            last[k] = i
+    return last
+
+def rotation_order(candidates, all_products, posted, key_fn, field):
+    """Return (ordered_keys, groups). Never-posted keys first, then the one posted longest ago."""
+    last = _last_used(posted, all_products, key_fn, field)
+    cat_last = _last_used(posted, all_products, category_key, "category")
     groups = {}
     for p in candidates:
-        groups.setdefault(category_key(p), []).append(p)
+        groups.setdefault(key_fn(p), []).append(p)
     for items in groups.values():
-        items.sort(key=lambda p: p.get("createdAt", ""), reverse=True)   # Newest first
-    # Never-posted categories first (-1), then the one posted longest ago.
-    # Tie-break: category with the newest product first.
-    cats = sorted(groups, key=lambda c: groups[c][0].get("createdAt", ""), reverse=True)
-    cats.sort(key=lambda c: last_used.get(c, -1))
-    return cats, groups, last_used
+        items.sort(key=lambda p: p.get("createdAt", ""), reverse=True)        # Newest first...
+        items.sort(key=lambda p: cat_last.get(category_key(p), -1))           # ...fresh category first
+    keys = sorted(groups, key=lambda k: max(p.get("createdAt", "") for p in groups[k]), reverse=True)
+    keys.sort(key=lambda k: last.get(k, -1))
+    return keys, groups
+
+def pick_order(candidates, all_products, posted):
+    if ROTATE_BY == "category":
+        return rotation_order(candidates, all_products, posted, category_key, "category")
+    return rotation_order(candidates, all_products, posted, merchant_key, "merchant")
+
+def category_order(candidates, all_products, posted):
+    keys, groups = rotation_order(candidates, all_products, posted, category_key, "category")
+    return keys, groups, None
 
 
 def product_info(p):
@@ -333,10 +380,13 @@ def cmd_check():
         print("INFO: Facebook posting is off (FB_PAGE_ACCESS_TOKEN is not set)")
     print(f"OK: {len(products)} products in API, {len(ok)} postable, {len(left)} remaining")
     if left:
-        cats, groups, _ = category_order(left, products, load_posted())
-        print(f"OK: {len(cats)} categories with products left (next in rotation first):")
-        for c in cats:
-            print(f"   - {c}: {len(groups[c])} left")
+        if ROTATE_BY != "category":
+            print(f"OK: Merchant is read from the '{merchant_field_used(products)}' field")
+        keys, groups = pick_order(left, products, load_posted())
+        label = "categories" if ROTATE_BY == "category" else "merchants"
+        print(f"OK: {len(keys)} {label} with products left (next in rotation first):")
+        for k in keys:
+            print(f"   - {k}: {len(groups[k])} left (next: {groups[k][0].get('product_name')})")
 
 def cmd_next():
     os.makedirs(IMG_DIR, exist_ok=True)
@@ -348,11 +398,12 @@ def cmd_next():
         print("NO_PRODUCTS: All products have already been posted.")
         return
 
-    # Category rotation: take the newest product of the least recently posted category.
-    # If its photos fail, fall back to the next category (not the same one again).
-    cats, groups, _ = category_order(candidates, products, posted)
-    order = [groups[c][0] for c in cats] + [p for c in cats for p in groups[c][1:]]
-    print(f"INFO: Category order today: {' | '.join(cats[:5])}{' ...' if len(cats) > 5 else ''}")
+    # Merchant rotation (or category rotation if ROTATE_BY=category): take one product from the
+    # merchant whose turn it is. If its photos fail, fall back to the next merchant, not the same one.
+    keys, groups = pick_order(candidates, products, posted)
+    order = [groups[k][0] for k in keys] + [p for k in keys for p in groups[k][1:]]
+    print(f"INFO: Rotation by {ROTATE_BY}, order today: "
+          f"{' | '.join(keys[:5])}{' ...' if len(keys) > 5 else ''}")
 
     os.makedirs(RAW_DIR, exist_ok=True)
     for p in order[:3]:
@@ -363,7 +414,8 @@ def cmd_next():
             except Exception:
                 continue
         if raw:
-            data = {"id": p["_id"], "category": category_key(p), "info": product_info(p),
+            data = {"id": p["_id"], "merchant": merchant_key(p), "category": category_key(p),
+                    "info": product_info(p),
                     "raw_images": raw, "images": [], "remaining_after_this": len(candidates) - 1}
             with open(NEXT_FILE, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False, indent=1)
@@ -446,8 +498,9 @@ def cmd_post(caption_file):
         except Exception as e:
             fb_status, fb_extra = f"Facebook: FAILED ({e})", {"facebook_error": str(e)[:300]}
 
-    if data.get("category"):
-        fb_extra["category"] = data["category"]   # Remembered for tomorrow's category rotation
+    for k in ("merchant", "category"):   # Remembered for tomorrow's rotation
+        if data.get(k):
+            fb_extra[k] = data[k]
     mark_posted(data["id"], data["info"]["name"], instagram_media_id=r["id"], **fb_extra)
     os.remove(NEXT_FILE)
     print(f"POSTED: {data['info']['name']} | {len(urls)} photos | Instagram media id {r['id']} | {fb_status}")
